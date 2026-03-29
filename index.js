@@ -28,6 +28,112 @@ app.get("/api/lead", (req, res) => {
   });
 });
 
+async function sendTelegram(text) {
+  const response = await fetch(
+    `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        chat_id: process.env.TELEGRAM_CHAT_ID,
+        text
+      })
+    }
+  );
+
+  const result = await response.json();
+
+  if (!response.ok || !result.ok) {
+    throw new Error(`Telegram error: ${JSON.stringify(result)}`);
+  }
+
+  return result;
+}
+
+async function logToGoogleSheet(payload) {
+  if (!process.env.GOOGLE_SCRIPT_URL) {
+    return "Skipped: no GOOGLE_SCRIPT_URL";
+  }
+
+  const response = await fetch(process.env.GOOGLE_SCRIPT_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const text = await response.text();
+  console.log("Google Script raw response:", text);
+
+  if (!response.ok) {
+    throw new Error(`Google Sheet logging failed: ${response.status} ${text}`);
+  }
+
+  return text;
+}
+
+async function sendWhatsAppTemplate({ name, phone, service }) {
+  if (
+    !process.env.WHATSAPP_ACCESS_TOKEN ||
+    !process.env.WHATSAPP_PHONE_NUMBER_ID ||
+    !process.env.WHATSAPP_TEMPLATE_NAME
+  ) {
+    return { skipped: true, reason: "WhatsApp env vars not set" };
+  }
+
+  let cleanPhone = String(phone || "").replace(/\D/g, "");
+
+  if (cleanPhone.length === 10) {
+    cleanPhone = `91${cleanPhone}`;
+  }
+
+  if (!cleanPhone) {
+    return { skipped: true, reason: "Invalid phone" };
+  }
+
+  const response = await fetch(
+    `https://graph.facebook.com/v23.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to: cleanPhone,
+        type: "template",
+        template: {
+          name: process.env.WHATSAPP_TEMPLATE_NAME,
+          language: {
+            code: process.env.WHATSAPP_TEMPLATE_LANG || "en"
+          },
+          components: [
+            {
+              type: "body",
+              parameters: [
+                { type: "text", text: name || "Customer" },
+                { type: "text", text: service || "travel enquiry" }
+              ]
+            }
+          ]
+        }
+      })
+    }
+  );
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(`WhatsApp API error: ${JSON.stringify(result)}`);
+  }
+
+  return result;
+}
+
 app.post("/api/lead", async (req, res) => {
   try {
     const {
@@ -44,7 +150,9 @@ app.post("/api/lead", async (req, res) => {
       source = "website",
       landing_page = "",
       campaign = "",
-      timestamp = ""
+      timestamp = "",
+      referrer = "",
+      user_agent = ""
     } = req.body;
 
     if (!name || !phone) {
@@ -56,7 +164,7 @@ app.post("/api/lead", async (req, res) => {
 
     const finalTravelDate = travel_date || travel_month || "";
 
-    const text = `
+    const telegramText = `
 🚀 New GoGlobal Lead
 
 Name: ${name}
@@ -72,58 +180,39 @@ Source: ${source}
 Landing Page: ${landing_page}
 Campaign: ${campaign}
 Timestamp: ${timestamp}
-`.trim();
+Referrer: ${referrer}
+    `.trim();
 
-    const telegramResponse = await fetch(
-      `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          chat_id: process.env.TELEGRAM_CHAT_ID,
-          text
-        })
-      }
-    );
+    await sendTelegram(telegramText);
 
-    const telegramResult = await telegramResponse.json();
-
-    if (!telegramResponse.ok || !telegramResult.ok) {
-      console.error("Telegram API error:", telegramResult);
-      return res.status(500).json({
-        success: false,
-        message: "Telegram notification failed."
+    try {
+      const sheetResult = await logToGoogleSheet({
+        name,
+        phone,
+        email,
+        service,
+        destination,
+        travel_date: finalTravelDate,
+        travellers,
+        callback_time,
+        message,
+        source,
+        landing_page,
+        campaign,
+        timestamp,
+        referrer,
+        user_agent
       });
+      console.log("Google Sheet logging success:", sheetResult);
+    } catch (sheetError) {
+      console.error("Google Sheet logging error:", sheetError);
     }
 
-    if (process.env.GOOGLE_SCRIPT_URL) {
-      try {
-        await fetch(process.env.GOOGLE_SCRIPT_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            name,
-            phone,
-            email,
-            service,
-            destination,
-            travel_date: finalTravelDate,
-            travellers,
-            callback_time,
-            message,
-            source,
-            landing_page,
-            campaign,
-            timestamp
-          })
-        });
-      } catch (sheetError) {
-        console.error("Google Sheet webhook error:", sheetError);
-      }
+    try {
+      const waResult = await sendWhatsAppTemplate({ name, phone, service });
+      console.log("WhatsApp follow-up result:", waResult);
+    } catch (waError) {
+      console.error("WhatsApp follow-up error:", waError);
     }
 
     return res.status(200).json({
